@@ -8,6 +8,7 @@
 #include <vector>
 #include <mutex>
 #include <condition_variable>
+#include <future>
 
 #include <unordered_map>
 
@@ -53,53 +54,48 @@ class Conn {
     //Used to control access to socket.
     std::mutex socket_mtx;
 
+    using Message_p = std::unique_ptr<Message>;
     //Stores messages that are to be sent to other threads.
     //We assume that IDs are unique for simplicity sake.
-    std::mutex store_mtx;
-    std::unordered_map<long, std::unique_ptr<Message>> msg_store;
-    //Stores temp condvars for particular request.
-    //If message with such ID is waited then thread is waken up.
-    std::unordered_map<long, std::condition_variable> coord_vars;
+    std::mutex await_rsps_mtx;
+    /**
+     * Map of Request ID to promise that resolves into response.
+     *
+     * It simplifies flow of code and allow to wait for actual response to appear.
+     * instead of using mutex and separate condvar to signal when response is available.
+     */
+    std::unordered_map<long, std::promise<Message_p>> await_rsps;
 
-    ///Adds condvar for thread with request id.
-    inline auto add_cond_var(long id) {
-        //Work around emplace with no arguments for condvar
-        return this->coord_vars.emplace(std::piecewise_construct, std::make_tuple(id), std::make_tuple());
+    /**
+     * Retrieves promise with response for Request's ID.
+     *
+     * If no one is still waiting for it then it is created.
+     * Otherwise reference to existing one is returned.
+     */
+    inline std::promise<Message_p>& get_awaiting_response(long id) {
+        std::lock_guard<std::mutex> store_lock(this->await_rsps_mtx);
+        return this->await_rsps[id];
     }
 
     /**
-     * Continuously waits for message with id.
+     * Waits until promise with Response for Request's ID is resolved.
      */
-    std::unique_ptr<Message> wait_for_message(long id) {
-        std::unique_lock<std::mutex> store_lock(this->store_mtx);
-        auto msg = this->msg_store.find(id);
+    inline Message_p wait_for_message(long id) {
+        auto result = this->get_awaiting_response(id).get_future().get();
+        {
 
-        if (msg == this->msg_store.cend()) {
-            //Insert thread's condvar and wait until another thread will notify us.
-            auto insert_res = this->add_cond_var(id);
-            insert_res.first->second.wait(store_lock);
-
-            msg = this->msg_store.find(id);
-
-            this->coord_vars.erase(insert_res.first);
+            std::lock_guard<std::mutex> store_lock(this->await_rsps_mtx);
+            this->await_rsps.erase(id);
         }
-
-        std::unique_ptr<Message> result = std::move(msg->second);
-        this->msg_store.erase(msg);
-
         return result;
     }
 
     /**
-     * Stores message and notify, if thread is already waiting for it.
+     * Stores resolved promise for Request's ID.
      */
-    inline void store_msg_and_notify(long id, std::unique_ptr<Message> msg) {
-        std::lock_guard<std::mutex> store_lock(this->store_mtx);
-        this->msg_store.emplace(id, std::move(msg));
-        auto coord = this->coord_vars.find(id);
-        if (coord != this->coord_vars.cend()) {
-            coord->second.notify_all();
-        }
+    inline void store_msg_and_notify(long id, Message_p msg) {
+        std::promise<Message_p>& await_rsp = this->get_awaiting_response(id);
+        await_rsp.set_value(std::move(msg));
     }
 
     public:
@@ -113,7 +109,7 @@ class Conn {
             Conn::random_wait();
 
             socket_lock.lock();
-            std::unique_ptr<Message> msg(this->receiveMessage());
+            Message_p msg(this->receiveMessage());
             socket_lock.unlock();
 
             auto expected_id = requestToSend->get_id();

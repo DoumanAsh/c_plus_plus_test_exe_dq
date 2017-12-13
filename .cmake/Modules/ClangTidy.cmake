@@ -11,7 +11,7 @@ else()
     set(DO_CLANG_TIDY "${CLANG_TIDY_EXE}"
         "-checks=*,-misc-unused-parameters,-llvm-*,-google-*"
         "-p=."
-        "-extra-arg-before=-std=c++17"
+        "-extra-arg-before=-std=c++14"
         "-header-filter=\\.hpp$"
     )
 endif()
